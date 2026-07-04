@@ -1,50 +1,107 @@
-name: EC2 Health Log
+name: Deploy SimpleBank
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   id-token: write
-  contents: write
+  contents: read
 
 env:
   AWS_REGION: us-east-1
+  ECR_REGISTRY: 720800607391.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: flaskapp-simple-bank
+  APP_TAG: flask
 
 jobs:
-  log:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: aws-actions/configure-aws-credentials@v4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: AWS Login via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::720800607391:role/github-action-deploy-role
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Collect + Log
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Build and push image
+        working-directory: 2-Tier-Deployment/Banking-app
+        run: |
+          docker build \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+            -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest \
+            .
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Validate targets
+        run: |
+          COUNT=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:App,Values=${{ env.APP_TAG }}" \
+              "Name=instance-state-name,Values=running" \
+            --query "length(Reservations[].Instances[])" \
+            --output text)
+
+          echo "Matched instances: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No running instances with tag App=${{ env.APP_TAG }}"
+            exit 1
+          fi
+
+      - name: Deploy via SSM
+        id: deploy
         run: |
           CMD_ID=$(aws ssm send-command \
-            --targets "Key=tag:App,Values=flask" \
+            --targets "Key=tag:App,Values=${{ env.APP_TAG }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters '{"commands":["hostname","hostname -I","uptime -p","df -h / | tail -1","free -h | grep Mem"]}' \
+            --comment "Deploy ${{ github.sha }} by ${{ github.actor }}" \
+            --parameters '{"commands":[
+              "echo === Deploy Start: ${{ github.sha }} ===",
+              "aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}",
+              "docker pull ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest",
+              "docker stop simplebank || true",
+              "docker rm simplebank || true",
+              "docker run -d --name simplebank -p 5000:5000 -e FLASK_ENV=production --restart unless-stopped ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest",
+              "sleep 5",
+              "docker ps | grep simplebank && echo === Container Running === || echo === Container Failed ==="
+            ]}' \
             --query 'Command.CommandId' --output text)
 
-          sleep 20
+          echo "cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
 
-          {
-            echo "Run #${{ github.run_number }} | $(date) | ${{ github.actor }}"
-            aws ssm list-command-invocations \
-              --command-id "$CMD_ID" --details \
-              --query "CommandInvocations[*].{Instance:InstanceId,Status:Status,Output:CommandPlugins[0].Output}" \
-              --output table
-          } > 2-Tier-Deployment/log.txt
-
-          cat 2-Tier-Deployment/log.txt
-
-      - name: Commit log
+      - name: Wait + Verify
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add 2-Tier-Deployment/log.txt
-          git diff --staged --quiet || git commit -m "log: run #${{ github.run_number }}"
-          git push
+          echo "Waiting for deploy to complete..."
+          sleep 40
+
+          echo "=== Deploy Status ==="
+          aws ssm list-command-invocations \
+            --command-id "${{ steps.deploy.outputs.cmd_id }}" \
+            --details \
+            --query "CommandInvocations[*].{Instance:InstanceId,Status:Status,Output:CommandPlugins[0].Output}" \
+            --output table
+
+          FAILED=$(aws ssm list-command-invocations \
+            --command-id "${{ steps.deploy.outputs.cmd_id }}" \
+            --query "length(CommandInvocations[?Status=='Failed'])" \
+            --output text)
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::error::Deploy failed on $FAILED instance(s)!"
+            exit 1
+          fi
+
+          echo "✅ All instances deployed successfully!"
