@@ -3,21 +3,6 @@ import random
 from flask import Flask, render_template, request, redirect, session
 import pymysql
 
-# Production: SSM se, Local: .env se
-if os.getenv("FLASK_ENV") == "production":
-    import boto3
-    def load_ssm_config(path="/simplebank/prod", region="us-east-1"):
-        client = boto3.client("ssm", region_name=region)
-        paginator = client.get_paginator("get_parameters_by_path")
-        for page in paginator.paginate(Path=path, WithDecryption=True):
-            for param in page["Parameters"]:
-                key = os.path.basename(param["Name"])
-                os.environ.setdefault(key, param["Value"])
-    load_ssm_config()
-else:
-    from dotenv import load_dotenv
-    load_dotenv()
-
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "fallbacksecret")
 
