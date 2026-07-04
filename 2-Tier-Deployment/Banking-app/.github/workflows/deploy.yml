@@ -1,0 +1,50 @@
+name: EC2 Health Log
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::720800607391:role/github-action-deploy-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Collect + Log
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --targets "Key=tag:App,Values=flask" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["hostname","hostname -I","uptime -p","df -h / | tail -1","free -h | grep Mem"]}' \
+            --query 'Command.CommandId' --output text)
+
+          sleep 20
+
+          {
+            echo "Run #${{ github.run_number }} | $(date) | ${{ github.actor }}"
+            aws ssm list-command-invocations \
+              --command-id "$CMD_ID" --details \
+              --query "CommandInvocations[*].{Instance:InstanceId,Status:Status,Output:CommandPlugins[0].Output}" \
+              --output table
+          } > 2-Tier-Deployment/log.txt
+
+          cat 2-Tier-Deployment/log.txt
+
+      - name: Commit log
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add 2-Tier-Deployment/log.txt
+          git diff --staged --quiet || git commit -m "log: run #${{ github.run_number }}"
+          git push
